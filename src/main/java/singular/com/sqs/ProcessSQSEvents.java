@@ -11,6 +11,8 @@ import io.sentry.Sentry;
 import io.sentry.SentryClient;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpRequestBase;
+import org.apache.http.concurrent.FutureCallback;
 import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
 import org.apache.http.impl.nio.client.HttpAsyncClients;
 import org.apache.log4j.Logger;
@@ -18,7 +20,8 @@ import org.apache.log4j.Logger;
 import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.Future;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 
 public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
@@ -50,15 +53,20 @@ public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
                 String body = msg.getBody();
                 Requests requests = new Gson().fromJson(body, Requests.class);
                 long start = System.currentTimeMillis();
+                final CountDownLatch latch = new CountDownLatch(requests.requests.size());
                 for(String request : requests.requests) {
                     try {
                         HttpGet httpRequest = new HttpGet(request);
-                        Future<HttpResponse> responseF = client.execute(httpRequest, null);
+                        client.execute(httpRequest, new ResponseHandler(latch, httpRequest));
                     }
                     catch (Exception e) {
                         System.out.println("Exception occurred while processing request: " + e.getMessage());
                     }
                 }
+                try {
+                    latch.await(3, TimeUnit.SECONDS);
+                }
+                catch (InterruptedException e) {}
                 long runTime = System.currentTimeMillis() - start;
                 statsd.histogram("batch.execution.time", runTime);
                 statsd.histogram("batch.size", requests.requests.size());
@@ -73,6 +81,30 @@ public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
         }
 
         return null;
+    }
+
+    class ResponseHandler implements FutureCallback<HttpResponse> {
+
+        private CountDownLatch latch;
+        private HttpRequestBase request;
+
+        public ResponseHandler(CountDownLatch latch, HttpRequestBase request) {
+            this.latch = latch;
+            this.request = request;
+        }
+
+        public void completed(final HttpResponse response) {
+            this.latch.countDown();
+        }
+
+        public void failed(final Exception ex) {
+            this.latch.countDown();
+        }
+
+        public void cancelled() {
+            this.latch.countDown();
+        }
+
     }
 
 }
