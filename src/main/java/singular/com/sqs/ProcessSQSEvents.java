@@ -20,8 +20,14 @@ import org.apache.log4j.Logger;
 import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+
+import org.asynchttpclient.AsyncHttpClient;
+import org.asynchttpclient.Response;
+
+import static java.util.stream.Collectors.toList;
+import static org.asynchttpclient.Dsl.asyncHttpClient;
+import static org.asynchttpclient.Dsl.digestAuthRealm;
 
 
 public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
@@ -46,27 +52,39 @@ public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
     {
         Sentry.init();
 
-        try (CloseableHttpAsyncClient client = HttpAsyncClients.createDefault()) {
-
+        try (AsyncHttpClient asyncHttpClient = asyncHttpClient()) {
             List<SQSEvent.SQSMessage> records = event.getRecords();
             for(SQSMessage msg : records) {
                 String body = msg.getBody();
                 Requests requests = new Gson().fromJson(body, Requests.class);
                 long start = System.currentTimeMillis();
-                final CountDownLatch latch = new CountDownLatch(requests.requests.size());
+                List<CompletableFuture<Response>> responsesF = new LinkedList<>();
                 for(String request : requests.requests) {
                     try {
-                        HttpGet httpRequest = new HttpGet(request);
-                        client.execute(httpRequest, new ResponseHandler(latch, httpRequest));
+                        CompletableFuture<Response> cf = asyncHttpClient
+                                .prepareGet(request)
+                                .execute()
+                                .toCompletableFuture();
+
+                        responsesF.add(cf);
                     }
                     catch (Exception e) {
                         System.out.println("Exception occurred while processing request: " + e.getMessage());
                     }
                 }
+                CompletableFuture<List<Response>> responseF = sequence(responsesF);
                 try {
-                    latch.await(3, TimeUnit.SECONDS);
+                    responseF.get(3, TimeUnit.SECONDS);
                 }
-                catch (InterruptedException e) {}
+                catch (java.util.concurrent.ExecutionException e) {
+                    statsd.increment("execution");
+                    System.out.println("Execution exception");
+                }
+                catch (java.util.concurrent.TimeoutException e) {
+                    statsd.increment("timeout");
+                    System.out.println("Timeout exception");
+                }
+                catch(InterruptedException e) {}
                 long runTime = System.currentTimeMillis() - start;
                 statsd.histogram("batch.execution.time", runTime);
                 statsd.histogram("batch.size", requests.requests.size());
@@ -86,9 +104,10 @@ public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
     class ResponseHandler implements FutureCallback<HttpResponse> {
 
         private CountDownLatch latch;
-        private HttpRequestBase request;
+        private String request;
 
-        public ResponseHandler(CountDownLatch latch, HttpRequestBase request) {
+
+        public ResponseHandler(CountDownLatch latch, String request) {
             this.latch = latch;
             this.request = request;
         }
@@ -99,12 +118,22 @@ public class ProcessSQSEvents implements RequestHandler<SQSEvent, Void> {
 
         public void failed(final Exception ex) {
             this.latch.countDown();
+            ProcessSQSEvents.this
+
         }
 
         public void cancelled() {
             this.latch.countDown();
         }
 
+    }
+
+    static<T> CompletableFuture<List<T>> sequence(List<CompletableFuture<T>> com) {
+        return CompletableFuture.allOf(com.toArray(new CompletableFuture<?>[com.size()]))
+                .thenApply(v -> com.stream()
+                        .map(CompletableFuture::join)
+                        .collect(toList())
+                );
     }
 
 }
